@@ -1,0 +1,207 @@
+#!/usr/bin/python3
+
+# sudo pip3 install argcomplete gitpython
+
+# PYTHON_ARGCOMPLETE_OK
+
+import argparse, argcomplete, os, git, subprocess, sys, random, re
+
+parser = argparse.ArgumentParser(description="Creates a minimal example")
+parser.add_argument('--target', help="Worktree with counterexample", default=".").completer = argcomplete.completers.DirectoriesCompleter()
+#parser.add_argument('--source', help="Worktree with counterexample").completer = argcomplete.completers.DirectoriesCompleter()
+parser.add_argument('--test', help="Script to test if example still works", required=True)
+argcomplete.autocomplete(parser)
+parser.add_argument('--show-chunks', help="Shows all chunks for given file (for debugging)").completer = argcomplete.completers.FilesCompleter()
+args = parser.parse_args()
+
+ex_repo = git.Repo(args.target)
+os.chdir(args.target)
+#orig_repo = git.Repo(args.source)
+
+class Chunk:
+    pass
+
+class RemoveFile(Chunk):
+    def __init__(self,file):
+        self.file = file
+
+    def __repr__(self):
+        return f"[remove {self.file}]"
+
+    def remove(self):
+        subprocess.run(['git','rm','--',self.file],check=True,stdin=subprocess.DEVNULL)
+
+
+class RemoveLines(Chunk):
+    def __init__(self,file,start,end):
+        self.file = file
+        self.start = start
+        self.end = end
+
+    def __repr__(self):
+        return f"[line {self.file}:{self.start}-{self.end} ({self.end-self.start+1} lines)]"
+        
+    def remove(self):
+        subprocess.run(['sed','-i','-e',f"{self.start},{self.end}d",'--',self.file], check=True)
+        
+class RemoveLine(Chunk):
+    def __init__(self,file,line):
+        self.file = file
+        self.line = line
+
+    def __repr__(self):
+        return f"[line {self.file}:{self.line}]"
+
+    def remove(self):
+        subprocess.run(['sed','-i','-e',f"{self.line}d",'--',self.file], check=True)
+
+
+class ChunkFinder:
+    pass
+
+class DefaultChunkFinder(ChunkFinder):
+    def get_chunks(self,f,chunks):
+        numlines = countlines(f)
+
+        # Large blocks of lines
+        for size in range(2,numlines+1):
+            start = random.randint(1,numlines-size+1)
+            end = start + size - 1
+            chunks.append(RemoveLines(f,start,end))
+
+        # Short blocks of lines
+        for start in range(1,numlines+1):
+            for end in range(start,min(start+10,numlines)+1):
+                chunks.append(RemoveLines(f,start,end))
+    
+                
+class MatchChunk(Chunk):
+    def __init__(self,match,replace):
+        self.start, self.end = match.span()
+        self.replace = replace
+
+class IsabelleProofChunk(MatchChunk):
+    def __init__(self,match):
+        super().__init__(match, '  sorry')
+
+        
+    def __repr__(self):
+        return f"[Isabelle proof in {self.file}: chars {self.start}-{self.end}]"
+    
+class IsabelleCommandChunk(MatchChunk):
+    def __init__(self,match):
+        super().__init__(match, '')
+        self.command = match.group(1)
+
+    
+    def __repr__(self):
+        return f"[Isabelle {self.command} in {self.file}: chars {self.start}-{self.end}]"
+    
+    
+class MLChunk(MatchChunk):
+    def __init__(self,match):
+        super().__init__(match, '')
+        self.command = match.group(1)
+    
+    def __repr__(self):
+        return f"[ML {self.command} in {self.file}: chars {self.start}-{self.end}]"
+
+        
+class IsabelleChunkFinder(ChunkFinder):
+    def get_chunks(self,f,chunks):
+        content = open(f,'rb').read()
+        #print(content)
+
+        for m in re.finditer(rb"^proof\b.*$(\n^.*$)*?\n^qed\b.*$",content,re.MULTILINE):
+            chunks.append(IsabelleProofChunk(m))
+
+        for m in re.finditer(rb"^(lemma)\b.*(\n^\s.*$)*",content,re.MULTILINE):
+            chunks.append(IsabelleCommandChunk(m))
+
+        
+class MLChunkFinder(ChunkFinder):
+    def get_chunks(self,f,chunks):
+        content = open(f,'rb').read()
+        #print(content)
+
+        for m in re.finditer(rb"^(val|fun)\b.*(\n^\s.*$)*",content,re.MULTILINE):
+            chunks.append(MLChunk(m))
+
+default_chunk_finder = DefaultChunkFinder()
+                
+def countlines(f):
+    result = subprocess.run(["wc","-l","--",f],check=True,stdout=subprocess.PIPE).stdout
+    return int(result.split()[0])
+
+
+chunk_finders = {
+    '.thy': IsabelleChunkFinder()
+}
+
+def get_chunks_file(f,chunks):
+    chunks.append(RemoveFile(f))
+
+    if (not os.path.islink(f)) and os.path.isfile(f):
+        basename, extension = os.path.splitext(f)
+        print("ext",extension)
+        chunk_finder = chunk_finders.get(extension,default_chunk_finder)
+        chunk_finder.get_chunks(f,chunks)
+
+def get_chunks():
+    print("Scanning for chunks")
+    tree = ex_repo.tree("HEAD")
+    files = [f.path for f in tree.traverse(prune=lambda i,d: i.type=='submodule')]
+
+    chunks = []
+    for f in files:
+        get_chunks_file(f,chunks)
+            
+    #print(chunks)
+    return chunks
+
+def try_remove_chunk(chunk):
+    print(f"Trying: {chunk}")
+    
+    subprocess.run("git reset --hard",shell=True,check=True)    
+
+    chunk.remove()
+
+    result = subprocess.run(args.test,shell=True,check=False,stdin=subprocess.DEVNULL)
+
+    if result.returncode==0:
+        print("Success")
+        subprocess.run(["git","commit","-a","-m",f"Change for minimal example: {chunk}"], check=True)
+        return True
+    else:
+        print("Example does not work any more (after {chunk})")
+        return False
+
+def remove_some_chunk():
+    chunks = get_chunks()
+    random.shuffle(chunks)
+    for chunk in chunks:
+        success = try_remove_chunk(chunk)
+        if success:
+            return True
+    return False
+
+def minimize():
+    subprocess.run("git checkout --detach",shell=True,check=True)    
+    subprocess.run("git reset --hard",shell=True,check=True)
+    while True:
+        success = remove_some_chunk()
+        if not success:
+            print("Minimal")
+            subprocess.run("git reset --hard",shell=True,check=True)    
+            return
+        
+def show_chunks(file):
+    chunks = []
+    get_chunks_file(file,chunks)
+    for chunk in chunks:
+        print(chunk)
+        
+if args.show_chunks is not None:
+    show_chunks(args.show_chunks)
+else:
+    minimize()
