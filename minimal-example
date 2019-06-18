@@ -12,19 +12,51 @@ parser.add_argument('--target', help="Worktree with counterexample", default="."
 parser.add_argument('--test', help="Script to test if example still works", required=True)
 argcomplete.autocomplete(parser)
 parser.add_argument('--show-chunks', help="Shows all chunks for given file (for debugging)").completer = argcomplete.completers.FilesCompleter()
+parser.add_argument('--exclude', nargs="+", help="Do not modify these files").completer = argcomplete.completers.FilesCompleter()
+parser.add_argument('--try-commit', nargs="+", help="Commits containing changes to try")
+parser.add_argument('--focus-on', nargs='+', help="Only try to edit these files").completer = argcomplete.completers.FilesCompleter()
 args = parser.parse_args()
 
 ex_repo = git.Repo(args.target)
 os.chdir(args.target)
 #orig_repo = git.Repo(args.source)
 
+try_commits = list(args.try_commit) if args.try_commit is not None else []
+
 class Chunk:
     pass
+
+class ChunkNotApplicable(Exception):
+    pass
+
+class DiffChunk(Chunk):
+    def __init__(self,commit):
+        self.commit = commit
+        self.commit_obj = None
+
+    def fill_in(self):
+        if self.commit_obj is None:
+            self.commit_obj = ex_repo.commit(self.commit)
+
+    def __repr__(self):
+        self.fill_in()
+        message = self.commit_obj.message
+        if message=='': message="<no message>"
+        message1 = message.splitlines()[0]
+        return f"[diff {self.commit} {message1}]"
+
+    def remove(self):
+        global try_commits
+        try_commits.remove(self.commit)
+        # Ignoring errors because failed cherry-pick might still have useful changes worth trying
+        subprocess.run(['git','cherry-pick','-n','--strategy','recursive','-Xtheirs','--',self.commit_obj.hexsha])
+        status = ex_repo.git.status("-s","-uno")
+        if status=='': raise ChunkNotApplicable()
 
 class RemoveFile(Chunk):
     def __init__(self,file):
         self.file = file
-
+        
     def __repr__(self):
         return f"[remove {self.file}]"
 
@@ -73,51 +105,63 @@ class DefaultChunkFinder(ChunkFinder):
         for start in range(1,numlines+1):
             for end in range(start,min(start+10,numlines)+1):
                 chunks.append(RemoveLines(f,start,end))
-    
                 
 class MatchChunk(Chunk):
-    def __init__(self,match,replace):
+    def __init__(self,file,match,replace):
+        self.file = file
         self.start, self.end = match.span()
         self.replace = replace
 
+    def remove(self):
+        with open(self.file,"rb") as fh:
+            content = fh.read()
+        content = b''.join((content[:self.start], self.replace, content[self.end:]))
+        with open(self.file,"wb") as fh:
+            fh.write(content)
+
 class IsabelleProofChunk(MatchChunk):
-    def __init__(self,match):
-        super().__init__(match, '  sorry')
+    def __init__(self,file,match):
+        super().__init__(file, match, b'  sorry')
 
         
     def __repr__(self):
         return f"[Isabelle proof in {self.file}: chars {self.start}-{self.end}]"
     
 class IsabelleCommandChunk(MatchChunk):
-    def __init__(self,match):
-        super().__init__(match, '')
+    def __init__(self,file, match):
+        super().__init__(file, match, b'')
         self.command = match.group(1)
 
     
     def __repr__(self):
-        return f"[Isabelle {self.command} in {self.file}: chars {self.start}-{self.end}]"
+        return f"[Isabelle {self.command.decode()} in {self.file}: chars {self.start}-{self.end}]"
     
     
 class MLChunk(MatchChunk):
-    def __init__(self,match):
-        super().__init__(match, '')
+    def __init__(self,file, match):
+        super().__init__(file, match, b'')
         self.command = match.group(1)
     
     def __repr__(self):
-        return f"[ML {self.command} in {self.file}: chars {self.start}-{self.end}]"
+        return f"[ML {self.command.decode()} in {self.file}: chars {self.start}-{self.end}]"
 
         
 class IsabelleChunkFinder(ChunkFinder):
     def get_chunks(self,f,chunks):
-        content = open(f,'rb').read()
+        with open(f,'rb') as fh:
+            content = fh.read()
         #print(content)
 
         for m in re.finditer(rb"^proof\b.*$(\n^.*$)*?\n^qed\b.*$",content,re.MULTILINE):
-            chunks.append(IsabelleProofChunk(m))
+            chunks.append(IsabelleProofChunk(f,m))
 
-        for m in re.finditer(rb"^(lemma)\b.*(\n^\s.*$)*",content,re.MULTILINE):
-            chunks.append(IsabelleCommandChunk(m))
+        for m in re.finditer(rb"^((lemma|theorem|typedef|definition|lift_definition)\b.*)(\n^\s.*$)*",content,re.MULTILINE):
+            chunks.append(IsabelleCommandChunk(f,m))
 
+#        for m in re.finditer(rb"^\s*by\b.*$",content,re.MULTILINE):
+#            chunks.append(IsabelleApplyScriptChunk(f,m))
+
+            
         
 class MLChunkFinder(ChunkFinder):
     def get_chunks(self,f,chunks):
@@ -125,17 +169,18 @@ class MLChunkFinder(ChunkFinder):
         #print(content)
 
         for m in re.finditer(rb"^(val|fun)\b.*(\n^\s.*$)*",content,re.MULTILINE):
-            chunks.append(MLChunk(m))
+            chunks.append(MLChunk(f, m))
 
 default_chunk_finder = DefaultChunkFinder()
-                
+
 def countlines(f):
     result = subprocess.run(["wc","-l","--",f],check=True,stdout=subprocess.PIPE).stdout
     return int(result.split()[0])
 
 
 chunk_finders = {
-    '.thy': IsabelleChunkFinder()
+    '.thy': IsabelleChunkFinder(),
+    '.ML': MLChunkFinder(),
 }
 
 def get_chunks_file(f,chunks):
@@ -143,45 +188,73 @@ def get_chunks_file(f,chunks):
 
     if (not os.path.islink(f)) and os.path.isfile(f):
         basename, extension = os.path.splitext(f)
-        print("ext",extension)
+        #print("ext",extension)
         chunk_finder = chunk_finders.get(extension,default_chunk_finder)
         chunk_finder.get_chunks(f,chunks)
 
 def get_chunks():
     print("Scanning for chunks")
     tree = ex_repo.tree("HEAD")
-    files = [f.path for f in tree.traverse(prune=lambda i,d: i.type=='submodule')]
+    if args.focus_on is None:
+        files = [f.path for f in tree.traverse(prune=lambda i,d: i.type=='submodule')]
+    else:
+        files = args.focus_on
 
     chunks = []
+    
     for f in files:
+        #print(f,args.exclude)
+        if f in args.exclude: continue
+        if os.path.isdir(f): continue
         get_chunks_file(f,chunks)
             
+    random.shuffle(chunks)
     #print(chunks)
+
+    for commit in try_commits:
+        chunks.insert(0,DiffChunk(commit))
+
     return chunks
 
 def try_remove_chunk(chunk):
-    print(f"Trying: {chunk}")
+    print("\n========================================================================\n")
+    print(f"Trying: {chunk}\n")
     
     subprocess.run("git reset --hard",shell=True,check=True)    
 
-    chunk.remove()
+    try:
+        chunk.remove()
+    except ChunkNotApplicable:
+        print("Chunk not applicable")
+        return False
 
     result = subprocess.run(args.test,shell=True,check=False,stdin=subprocess.DEVNULL)
 
     if result.returncode==0:
-        print("Success")
+        print(f"*** Success: {chunk}")
         subprocess.run(["git","commit","-a","-m",f"Change for minimal example: {chunk}"], check=True)
+        ex_repo.create_tag('minimal-example-current','HEAD',force=True)
         return True
     else:
-        print("Example does not work any more (after {chunk})")
+        print(f"*** Example does not work any more (after {chunk})")
         return False
 
 def remove_some_chunk():
     chunks = get_chunks()
-    random.shuffle(chunks)
     for chunk in chunks:
+        if find_new_commits():
+            return True
         success = try_remove_chunk(chunk)
         if success:
+            return True
+    return False
+
+def find_new_commits():
+    for t in ex_repo.tags:
+        if t.name.startswith("minex-do-me"):
+            print(f"Adding tag {t.name} to list of diffs to try.")
+            try_commits.append(t.commit.hexsha)
+            ex_repo.delete_tag(t)
             return True
     return False
 
@@ -189,10 +262,11 @@ def minimize():
     subprocess.run("git checkout --detach",shell=True,check=True)    
     subprocess.run("git reset --hard",shell=True,check=True)
     while True:
+        #if random.choice([True,False]): # For testing purposes. Remove!
         success = remove_some_chunk()
         if not success:
             print("Minimal")
-            subprocess.run("git reset --hard",shell=True,check=True)    
+            subprocess.run("git reset --hard",shell=True,check=True)
             return
         
 def show_chunks(file):
